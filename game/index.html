@@ -1,0 +1,606 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VOIDSWARM — Neon Arena Survival</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #05060f; height: 100%; overflow: hidden;
+    font-family: "Segoe UI", system-ui, sans-serif; }
+  #wrap { display: flex; align-items: center; justify-content: center; height: 100vh; }
+  canvas { background: #05060f; box-shadow: 0 0 60px rgba(80, 120, 255, .25);
+    border: 1px solid #1c2450; max-width: 98vw; max-height: 96vh; cursor: crosshair; }
+  #hint { position: fixed; bottom: 8px; width: 100%; text-align: center; color: #5a6a9e;
+    font-size: 12px; letter-spacing: .08em; pointer-events: none; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game" width="960" height="600"></canvas></div>
+<div id="hint">WASD / ARROWS MOVE &nbsp;·&nbsp; MOUSE AIM &nbsp;·&nbsp; HOLD CLICK / SPACE FIRE &nbsp;·&nbsp; SHIFT DASH &nbsp;·&nbsp; P PAUSE &nbsp;·&nbsp; M MUTE</div>
+<script>
+"use strict";
+/* VOIDSWARM — neon arena survival. Static files only, no assets, no deps.
+   Goal: survive escalating waves, chain kills for a combo multiplier, beat
+   your high score. Start / restart buttons are drawn on-canvas. */
+
+var canvas = document.getElementById("game");
+var ctx = canvas.getContext("2d");
+var W = canvas.width, H = canvas.height;
+
+var state = "menu";           // menu | playing | paused | over
+var score = 0, high = 0, combo = 0, bestCombo = 0, wave = 0;
+var lives = 3, kills = 0, elapsed = 0;
+var shake = 0, intermission = 0, spawnQueue = 0, spawnTimer = 0;
+var muted = false, slowmo = 0;
+
+try { high = parseInt(localStorage.getItem("voidswarm_high") || "0", 10) || 0; } catch (e) { high = 0; }
+
+var keys = {};
+var mouse = { x: W / 2, y: H / 2 - 120, down: false, seen: false };
+var touch = { active: false, x: W / 2, y: H / 2 };
+
+var player = null;
+var bullets = [], ebullets = [], enemies = [], particles = [], pickups = [], texts = [];
+var stars = [];
+for (var i = 0; i < 130; i++) {
+  stars.push({ x: Math.random() * W, y: Math.random() * H, r: Math.random() * 1.6 + 0.3,
+               tw: Math.random() * Math.PI * 2, sp: 0.5 + Math.random() * 1.5 });
+}
+
+var TYPES = {
+  chaser:   { r: 15, hp: 1, speed: 120, score: 100, color: "#ff4d8d", shape: "diamond" },
+  weaver:   { r: 14, hp: 2, speed: 150, score: 150, color: "#ff9f1c", shape: "hex" },
+  splitter: { r: 22, hp: 3, speed: 70,  score: 200, color: "#2ee66b", shape: "square" },
+  mini:     { r: 9,  hp: 1, speed: 210, score: 50,  color: "#ff4d8d", shape: "tri" },
+  shooter:  { r: 16, hp: 2, speed: 95,  score: 250, color: "#b565ff", shape: "penta" }
+};
+
+/* ---------- audio (tiny WebAudio bleeps, no assets) ---------- */
+var AC = null;
+function ac() {
+  if (muted) return null;
+  try {
+    if (!AC) AC = new (window.AudioContext || window.webkitAudioContext)();
+    if (AC.state === "suspended") AC.resume();
+    return AC;
+  } catch (e) { return null; }
+}
+function beep(freq, dur, type, vol, slide) {
+  var a = ac(); if (!a) return;
+  try {
+    var o = a.createOscillator(), g = a.createGain();
+    o.type = type || "square"; o.frequency.setValueAtTime(freq, a.currentTime);
+    if (slide) o.frequency.exponentialRampToValueAtTime(Math.max(20, slide), a.currentTime + dur);
+    g.gain.setValueAtTime(vol || 0.05, a.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, a.currentTime + dur);
+    o.connect(g); g.connect(a.destination);
+    o.start(); o.stop(a.currentTime + dur);
+  } catch (e) { /* audio is cosmetic */ }
+}
+
+/* ---------- helpers ---------- */
+function rand(a, b) { return a + Math.random() * (b - a); }
+function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
+function dist2(ax, ay, bx, by) { var dx = ax - bx, dy = ay - by; return dx * dx + dy * dy; }
+function mult() { return Math.min(5, 1 + Math.floor(combo / 10)); }
+function edgePoint() {
+  var side = Math.floor(Math.random() * 4), m = 30;
+  if (side === 0) return { x: rand(0, W), y: -m };
+  if (side === 1) return { x: W + m, y: rand(0, H) };
+  if (side === 2) return { x: rand(0, W), y: H + m };
+  return { x: -m, y: rand(0, H) };
+}
+function burst(x, y, color, n, speed) {
+  for (var i = 0; i < n; i++) {
+    var a = Math.random() * Math.PI * 2, s = rand(speed * 0.3, speed);
+    particles.push({ x: x, y: y, vx: Math.cos(a) * s, vy: Math.sin(a) * s,
+      life: rand(0.3, 0.8), max: 0.8, color: color, size: rand(2, 5) });
+  }
+}
+function floatText(x, y, str, color) { texts.push({ x: x, y: y, str: str, color: color, life: 0.9 }); }
+
+function resetPlayer() {
+  player = { x: W / 2, y: H / 2 + 80, vx: 0, vy: 0, angle: -Math.PI / 2, r: 14,
+    fireCd: 0, dashCd: 0, dashT: 0, invuln: 2, shield: false, rapidT: 0, spreadT: 0 };
+}
+function startGame() {
+  score = 0; combo = 0; bestCombo = 0; wave = 0; lives = 3; kills = 0; elapsed = 0;
+  bullets = []; ebullets = []; enemies = []; particles = []; pickups = []; texts = [];
+  spawnQueue = 0; intermission = 1.2; slowmo = 0;
+  resetPlayer();
+  state = "playing";
+  beep(440, 0.12, "square", 0.05, 880);
+}
+function nextWave() {
+  wave++;
+  var count = 6 + wave * 3;
+  spawnQueue = count; spawnTimer = 0;
+  floatText(W / 2, H / 2 - 60, "WAVE " + wave, "#7df9ff");
+  if (wave % 3 === 0 && lives < 5) { lives++; floatText(W / 2, H / 2 - 30, "+1 LIFE", "#2ee66b"); }
+  beep(330, 0.15, "triangle", 0.06, 660);
+}
+function pickType() {
+  var roll = Math.random();
+  if (wave >= 3 && roll < 0.14) return "shooter";
+  if (wave >= 2 && roll < 0.32) return "splitter";
+  if (roll < 0.62) return "chaser";
+  return "weaver";
+}
+function spawnEnemy() {
+  var p = edgePoint(), t = pickType(), base = TYPES[t];
+  enemies.push({ type: t, x: p.x, y: p.y, vx: 0, vy: 0, r: base.r, hp: base.hp,
+    speed: base.speed * (1 + wave * 0.04), score: base.score, color: base.color,
+    shape: base.shape, t: rand(0, 10), fireCd: rand(1.2, 2.4) });
+}
+function dropPickup(x, y) {
+  if (Math.random() > 0.14) return;
+  var kinds = ["S", "R", "W"];
+  pickups.push({ x: x, y: y, vx: rand(-30, 30), vy: rand(10, 40),
+    kind: kinds[Math.floor(Math.random() * kinds.length)], life: 9, t: 0 });
+}
+function killEnemy(e, idx) {
+  var m = mult();
+  var gained = e.score * m;
+  score += gained; kills++; combo++; bestCombo = Math.max(bestCombo, combo);
+  floatText(e.x, e.y, "+" + gained + (m > 1 ? "  x" + m : ""), e.color);
+  burst(e.x, e.y, e.color, e.type === "splitter" ? 26 : 16, 260);
+  beep(520, 0.08, "square", 0.04, 180);
+  if (e.type === "splitter") {
+    for (var i = 0; i < 2; i++) {
+      var b = TYPES.mini;
+      enemies.push({ type: "mini", x: e.x + rand(-14, 14), y: e.y + rand(-14, 14),
+        vx: rand(-120, 120), vy: rand(-120, 120), r: b.r, hp: 1, speed: b.speed,
+        score: b.score, color: b.color, shape: b.shape, t: rand(0, 10), fireCd: 0 });
+    }
+  }
+  dropPickup(e.x, e.y);
+  enemies.splice(idx, 1);
+}
+function hurtPlayer() {
+  if (!player || player.invuln > 0 || state !== "playing") return;
+  if (player.shield) {
+    player.shield = false; player.invuln = 1.2;
+    burst(player.x, player.y, "#7df9ff", 22, 300);
+    beep(300, 0.2, "sawtooth", 0.06, 90);
+    return;
+  }
+  lives--; combo = 0; player.invuln = 2; shake = 14; slowmo = 0.25;
+  burst(player.x, player.y, "#ff4d5e", 30, 340);
+  beep(160, 0.35, "sawtooth", 0.08, 40);
+  if (lives <= 0) gameOver();
+}
+function gameOver() {
+  state = "over";
+  if (score > high) {
+    high = score;
+    try { localStorage.setItem("voidswarm_high", String(high)); } catch (e) {}
+  }
+  burst(player.x, player.y, "#ffffff", 50, 420);
+  beep(220, 0.6, "sawtooth", 0.07, 30);
+}
+
+/* ---------- update ---------- */
+function update(dt) {
+  elapsed += dt;
+  if (shake > 0) shake = Math.max(0, shake - dt * 30);
+  if (slowmo > 0) slowmo -= dt;
+  var i, j, e, b;
+
+  // player movement
+  var ax = 0, ay = 0;
+  if (keys["arrowleft"] || keys["a"]) ax -= 1;
+  if (keys["arrowright"] || keys["d"]) ax += 1;
+  if (keys["arrowup"] || keys["w"]) ay -= 1;
+  if (keys["arrowdown"] || keys["s"]) ay += 1;
+  if (touch.active) {
+    var dx = touch.x - player.x, dy = touch.y - player.y, d = Math.hypot(dx, dy);
+    if (d > 8) { ax = dx / d; ay = dy / d; }
+    mouse.x = touch.x; mouse.y = touch.y; mouse.down = true;
+  }
+  var len = Math.hypot(ax, ay);
+  if (len > 0) { ax /= len; ay /= len; }
+  var accel = 2400;
+  player.vx += ax * accel * dt; player.vy += ay * accel * dt;
+  player.vx *= Math.pow(0.12, dt); player.vy *= Math.pow(0.12, dt);
+  var spd = Math.hypot(player.vx, player.vy), max = 340;
+  if (spd > max) { player.vx *= max / spd; player.vy *= max / spd; }
+  if (player.dashT > 0) {
+    player.dashT -= dt;
+    player.x += Math.cos(player.angle) * 900 * dt;
+    player.y += Math.sin(player.angle) * 900 * dt;
+    burst(player.x, player.y, "#7df9ff", 2, 60);
+  } else {
+    player.x += player.vx * dt; player.y += player.vy * dt;
+  }
+  player.x = clamp(player.x, 16, W - 16); player.y = clamp(player.y, 16, H - 16);
+  player.angle = Math.atan2(mouse.y - player.y, mouse.x - player.x);
+  if (player.fireCd > 0) player.fireCd -= dt;
+  if (player.dashCd > 0) player.dashCd -= dt;
+  if (player.invuln > 0) player.invuln -= dt;
+  if (player.rapidT > 0) player.rapidT -= dt;
+  if (player.spreadT > 0) player.spreadT -= dt;
+
+  // fire
+  var firing = mouse.down || keys[" "] || touch.active;
+  if (firing && player.fireCd <= 0) {
+    player.fireCd = player.rapidT > 0 ? 0.08 : 0.16;
+    var spreads = player.spreadT > 0 ? [-0.22, 0, 0.22] : [0];
+    for (var s = 0; s < spreads.length; s++) {
+      var a = player.angle + spreads[s];
+      bullets.push({ x: player.x + Math.cos(a) * 20, y: player.y + Math.sin(a) * 20,
+        vx: Math.cos(a) * 640, vy: Math.sin(a) * 640, life: 0.9, r: 4 });
+    }
+    beep(880, 0.05, "square", 0.025, 620);
+  }
+
+  // dash
+  if ((keys["shift"] || keys["e"]) && player.dashCd <= 0 && len > 0) {
+    player.dashCd = 2.2; player.dashT = 0.15; player.invuln = Math.max(player.invuln, 0.35);
+    beep(300, 0.12, "sine", 0.05, 900);
+  }
+
+  // waves
+  if (spawnQueue > 0) {
+    spawnTimer -= dt;
+    if (spawnTimer <= 0) { spawnEnemy(); spawnQueue--; spawnTimer = Math.max(0.25, 0.9 - wave * 0.05); }
+  } else if (enemies.length === 0 && state === "playing") {
+    intermission -= dt;
+    if (intermission <= 0) { nextWave(); intermission = 2.5; }
+  }
+
+  // bullets
+  for (i = bullets.length - 1; i >= 0; i--) {
+    b = bullets[i];
+    b.x += b.vx * dt; b.y += b.vy * dt; b.life -= dt;
+    if (b.life <= 0 || b.x < -20 || b.x > W + 20 || b.y < -20 || b.y > H + 20) { bullets.splice(i, 1); continue; }
+    for (j = enemies.length - 1; j >= 0; j--) {
+      e = enemies[j];
+      if (dist2(b.x, b.y, e.x, e.y) < (b.r + e.r) * (b.r + e.r)) {
+        bullets.splice(i, 1);
+        e.hp -= 1;
+        burst(b.x, b.y, e.color, 4, 120);
+        if (e.hp <= 0) killEnemy(e, j);
+        break;
+      }
+    }
+  }
+
+  // enemies
+  for (i = enemies.length - 1; i >= 0; i--) {
+    e = enemies[i]; e.t += dt;
+    var pdx = player.x - e.x, pdy = player.y - e.y, pd = Math.hypot(pdx, pdy) || 1;
+    var nx = pdx / pd, ny = pdy / pd;
+    if (e.type === "weaver") {
+      var px = -ny * Math.sin(e.t * 3) * 0.9, py = nx * Math.sin(e.t * 3) * 0.9;
+      e.vx += (nx * e.speed + px * e.speed * 0.6 - e.vx) * dt * 2;
+      e.vy += (ny * e.speed + py * e.speed * 0.6 - e.vy) * dt * 2;
+    } else if (e.type === "shooter") {
+      var want = pd < 240 ? -1 : 1;
+      e.vx += (nx * e.speed * want - e.vx) * dt * 2;
+      e.vy += (ny * e.speed * want - e.vy) * dt * 2;
+      e.fireCd -= dt;
+      if (e.fireCd <= 0 && pd < 520) {
+        e.fireCd = 2.1;
+        ebullets.push({ x: e.x, y: e.y, vx: nx * 260, vy: ny * 260, life: 3, r: 5 });
+        beep(200, 0.1, "sawtooth", 0.03, 120);
+      }
+    } else {
+      e.vx += (nx * e.speed - e.vx) * dt * 2;
+      e.vy += (ny * e.speed - e.vy) * dt * 2;
+    }
+    e.x += e.vx * dt; e.y += e.vy * dt;
+    if (dist2(e.x, e.y, player.x, player.y) < (e.r + player.r - 3) * (e.r + player.r - 3)) {
+      e.hp = 0;
+      burst(e.x, e.y, e.color, 14, 240);
+      if (e.hp <= 0) killEnemy(e, i);
+      hurtPlayer();
+    }
+  }
+
+  // enemy bullets
+  for (i = ebullets.length - 1; i >= 0; i--) {
+    b = ebullets[i];
+    b.x += b.vx * dt; b.y += b.vy * dt; b.life -= dt;
+    if (b.life <= 0 || b.x < -20 || b.x > W + 20 || b.y < -20 || b.y > H + 20) { ebullets.splice(i, 1); continue; }
+    if (dist2(b.x, b.y, player.x, player.y) < (b.r + player.r - 2) * (b.r + player.r - 2)) {
+      ebullets.splice(i, 1);
+      hurtPlayer();
+    }
+  }
+
+  // pickups
+  for (i = pickups.length - 1; i >= 0; i--) {
+    var p = pickups[i]; p.t += dt; p.life -= dt;
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    p.vx *= Math.pow(0.2, dt); p.vy *= Math.pow(0.2, dt);
+    var mdx = player.x - p.x, mdy = player.y - p.y, md = Math.hypot(mdx, mdy) || 1;
+    if (md < 110) { p.x += mdx / md * 260 * dt; p.y += mdy / md * 260 * dt; }
+    if (p.life <= 0) { pickups.splice(i, 1); continue; }
+    if (md < player.r + 14) {
+      if (p.kind === "S") { player.shield = true; floatText(p.x, p.y, "SHIELD", "#7df9ff"); }
+      if (p.kind === "R") { player.rapidT = 8; floatText(p.x, p.y, "RAPID FIRE", "#ffd166"); }
+      if (p.kind === "W") { player.spreadT = 8; floatText(p.x, p.y, "SPREAD SHOT", "#ff9f1c"); }
+      beep(660, 0.12, "triangle", 0.05, 990);
+      pickups.splice(i, 1);
+    }
+  }
+
+  // particles & texts
+  for (i = particles.length - 1; i >= 0; i--) {
+    var pt = particles[i];
+    pt.x += pt.vx * dt; pt.y += pt.vy * dt; pt.life -= dt;
+    pt.vx *= Math.pow(0.1, dt); pt.vy *= Math.pow(0.1, dt);
+    if (pt.life <= 0) particles.splice(i, 1);
+  }
+  for (i = texts.length - 1; i >= 0; i--) {
+    texts[i].y -= 34 * dt; texts[i].life -= dt;
+    if (texts[i].life <= 0) texts.splice(i, 1);
+  }
+  for (i = 0; i < stars.length; i++) {
+    stars[i].tw += dt * stars[i].sp;
+    stars[i].y += stars[i].sp * 4 * dt;
+    if (stars[i].y > H) { stars[i].y = -2; stars[i].x = Math.random() * W; }
+  }
+}
+
+/* ---------- draw ---------- */
+function drawShape(x, y, r, shape, color, rot) {
+  ctx.save(); ctx.translate(x, y); ctx.rotate(rot || 0);
+  ctx.fillStyle = color; ctx.strokeStyle = color; ctx.lineWidth = 2;
+  ctx.beginPath();
+  if (shape === "diamond") { ctx.moveTo(0, -r); ctx.lineTo(r, 0); ctx.lineTo(0, r); ctx.lineTo(-r, 0); }
+  else if (shape === "hex") { for (var k = 0; k < 6; k++) { var a = k * Math.PI / 3; k ? ctx.lineTo(Math.cos(a) * r, Math.sin(a) * r) : ctx.moveTo(Math.cos(a) * r, Math.sin(a) * r); } }
+  else if (shape === "square") { ctx.rect(-r * 0.8, -r * 0.8, r * 1.6, r * 1.6); }
+  else if (shape === "penta") { for (var q = 0; q < 5; q++) { var b = q * Math.PI * 2 / 5 - Math.PI / 2; q ? ctx.lineTo(Math.cos(b) * r, Math.sin(b) * r) : ctx.moveTo(Math.cos(b) * r, Math.sin(b) * r); } }
+  else { ctx.moveTo(0, -r); ctx.lineTo(r, r); ctx.lineTo(-r, r); }
+  ctx.closePath(); ctx.globalAlpha = 0.85; ctx.fill(); ctx.globalAlpha = 1; ctx.stroke();
+  ctx.restore();
+}
+function draw() {
+  ctx.save();
+  if (shake > 0) ctx.translate(rand(-shake, shake), rand(-shake, shake));
+  var g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#070818"); g.addColorStop(0.6, "#0a0d26"); g.addColorStop(1, "#12082b");
+  ctx.fillStyle = g; ctx.fillRect(-20, -20, W + 40, H + 40);
+  // nebula blobs
+  ctx.globalAlpha = 0.16; ctx.fillStyle = "#274bff";
+  ctx.beginPath(); ctx.arc(W * 0.2, H * 0.25, 180, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = "#ff2e88";
+  ctx.beginPath(); ctx.arc(W * 0.85, H * 0.8, 150, 0, Math.PI * 2); ctx.fill();
+  ctx.globalAlpha = 1;
+  // stars
+  for (var i = 0; i < stars.length; i++) {
+    var s = stars[i];
+    ctx.globalAlpha = 0.35 + 0.4 * Math.abs(Math.sin(s.tw));
+    ctx.fillStyle = "#cfe4ff";
+    ctx.fillRect(s.x, s.y, s.r, s.r);
+  }
+  ctx.globalAlpha = 1;
+  // grid
+  ctx.strokeStyle = "rgba(90,120,255,0.07)"; ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (var gx = 0; gx <= W; gx += 60) { ctx.moveTo(gx, 0); ctx.lineTo(gx, H); }
+  for (var gy = 0; gy <= H; gy += 60) { ctx.moveTo(0, gy); ctx.lineTo(W, gy); }
+  ctx.stroke();
+
+  if (state === "menu") { drawMenu(); ctx.restore(); return; }
+
+  // pickups
+  for (i = 0; i < pickups.length; i++) {
+    var p = pickups[i];
+    var pc = p.kind === "S" ? "#7df9ff" : p.kind === "R" ? "#ffd166" : "#ff9f1c";
+    ctx.globalAlpha = 0.5 + 0.5 * Math.sin(p.t * 6);
+    ctx.fillStyle = pc; ctx.beginPath(); ctx.arc(p.x, p.y, 13, 0, Math.PI * 2); ctx.fill();
+    ctx.globalAlpha = 1; ctx.fillStyle = "#05060f";
+    ctx.font = "bold 13px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(p.kind, p.x, p.y + 0.5);
+  }
+  // enemies
+  for (i = 0; i < enemies.length; i++) {
+    var e = enemies[i];
+    drawShape(e.x, e.y, e.r, e.shape, e.color, e.t);
+    if (e.hp > 1) {
+      ctx.fillStyle = "rgba(255,255,255,0.25)";
+      ctx.fillRect(e.x - 14, e.y - e.r - 10, 28, 4);
+      ctx.fillStyle = e.color;
+      ctx.fillRect(e.x - 14, e.y - e.r - 10, 28 * (e.hp / TYPES[e.type].hp), 4);
+    }
+  }
+  // enemy bullets
+  for (i = 0; i < ebullets.length; i++) {
+    ctx.fillStyle = "#ff5d73";
+    ctx.beginPath(); ctx.arc(ebullets[i].x, ebullets[i].y, ebullets[i].r, 0, Math.PI * 2); ctx.fill();
+  }
+  // player bullets
+  for (i = 0; i < bullets.length; i++) {
+    ctx.fillStyle = "#ffe66d";
+    ctx.beginPath(); ctx.arc(bullets[i].x, bullets[i].y, bullets[i].r, 0, Math.PI * 2); ctx.fill();
+  }
+  // player
+  if (player && state !== "over") {
+    ctx.save(); ctx.translate(player.x, player.y);
+    if (player.invuln > 0 && Math.floor(elapsed * 14) % 2 === 0) ctx.globalAlpha = 0.35;
+    ctx.rotate(player.angle);
+    ctx.fillStyle = "#7df9ff";
+    ctx.beginPath(); ctx.moveTo(18, 0); ctx.lineTo(-12, -11); ctx.lineTo(-6, 0); ctx.lineTo(-12, 11);
+    ctx.closePath(); ctx.fill();
+    ctx.fillStyle = "#ff9f1c";
+    ctx.beginPath(); ctx.moveTo(-10, -4); ctx.lineTo(-18 - Math.random() * 8, 0); ctx.lineTo(-10, 4);
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+    if (player.shield) {
+      ctx.strokeStyle = "rgba(125,249,255,0.8)"; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(player.x, player.y, 26, 0, Math.PI * 2); ctx.stroke();
+    }
+    // aim line
+    ctx.strokeStyle = "rgba(125,249,255,0.25)"; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(player.x, player.y); ctx.lineTo(mouse.x, mouse.y); ctx.stroke();
+  }
+  // particles
+  for (i = 0; i < particles.length; i++) {
+    var pt = particles[i];
+    ctx.globalAlpha = Math.max(0, pt.life / pt.max);
+    ctx.fillStyle = pt.color;
+    ctx.fillRect(pt.x - pt.size / 2, pt.y - pt.size / 2, pt.size, pt.size);
+  }
+  ctx.globalAlpha = 1;
+  // floating texts
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  for (i = 0; i < texts.length; i++) {
+    var t = texts[i];
+    ctx.globalAlpha = Math.min(1, t.life * 2);
+    ctx.fillStyle = t.color; ctx.font = "bold 18px sans-serif";
+    ctx.fillText(t.str, t.x, t.y);
+  }
+  ctx.globalAlpha = 1;
+
+  drawHUD();
+  if (state === "paused") {
+    ctx.fillStyle = "rgba(5,6,15,0.72)"; ctx.fillRect(-20, -20, W + 40, H + 40);
+    ctx.fillStyle = "#7df9ff"; ctx.font = "bold 44px sans-serif";
+    ctx.fillText("PAUSED", W / 2, H / 2 - 10);
+    ctx.fillStyle = "#cfe4ff"; ctx.font = "18px sans-serif";
+    ctx.fillText("Tekan P untuk lanjut", W / 2, H / 2 + 34);
+  }
+  if (state === "over") drawGameOver();
+  ctx.restore();
+}
+function drawHUD() {
+  ctx.textAlign = "left"; ctx.textBaseline = "top";
+  ctx.fillStyle = "#ffffff"; ctx.font = "bold 22px sans-serif";
+  ctx.fillText("SCORE " + score, 16, 14);
+  ctx.fillStyle = "#8fa3d9"; ctx.font = "15px sans-serif";
+  ctx.fillText("BEST " + high + "   ·   WAVE " + Math.max(1, wave) + "   ·   KILLS " + kills, 16, 42);
+  if (combo >= 2) {
+    ctx.fillStyle = combo >= 10 ? "#ffd166" : "#7df9ff"; ctx.font = "bold 18px sans-serif";
+    ctx.fillText("COMBO x" + mult() + "  (" + combo + ")", 16, 64);
+  }
+  // lives
+  ctx.textAlign = "right";
+  ctx.fillStyle = "#ff4d6d"; ctx.font = "bold 22px sans-serif";
+  var hearts = "";
+  for (var h = 0; h < lives; h++) hearts += "♥ ";
+  ctx.fillText(hearts, W - 16, 14);
+  ctx.fillStyle = "#8fa3d9"; ctx.font = "13px sans-serif";
+  ctx.fillText(player.shield ? "SHIELD AKTIF" : "", W - 16, 44);
+  if (player.rapidT > 0) ctx.fillText("RAPID " + Math.ceil(player.rapidT) + "s", W - 16, 62);
+  if (player.spreadT > 0) ctx.fillText("SPREAD " + Math.ceil(player.spreadT) + "s", W - 16, 80);
+  // dash cooldown bar
+  var dfrac = player.dashCd <= 0 ? 1 : 1 - player.dashCd / 2.2;
+  ctx.fillStyle = "rgba(255,255,255,0.15)";
+  ctx.fillRect(W / 2 - 70, H - 22, 140, 8);
+  ctx.fillStyle = dfrac >= 1 ? "#7df9ff" : "#3d5a99";
+  ctx.fillRect(W / 2 - 70, H - 22, 140 * dfrac, 8);
+  ctx.fillStyle = "#8fa3d9"; ctx.font = "11px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText(dfrac >= 1 ? "DASH READY  [SHIFT]" : "DASH…", W / 2, H - 38);
+}
+function drawMenu() {
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillStyle = "#7df9ff"; ctx.font = "bold 64px sans-serif";
+  ctx.fillText("VOIDSWARM", W / 2, 150);
+  ctx.fillStyle = "#ff4d8d"; ctx.font = "bold 20px sans-serif";
+  ctx.fillText("NEON ARENA SURVIVAL", W / 2, 192);
+  ctx.fillStyle = "#cfe4ff"; ctx.font = "17px sans-serif";
+  ctx.fillText("Bertahanlah dari gelombang swarm. Rantai kill untuk combo multiplier.", W / 2, 250);
+  ctx.fillText("Dash menembus musuh, rebut pickup S / R / W. 3 nyawa — tiap 3 wave +1 nyawa.", W / 2, 276);
+  ctx.fillStyle = "#8fa3d9"; ctx.font = "15px sans-serif";
+  ctx.fillText("WASD / panah gerak  ·  mouse bidik  ·  tahan klik / spasi tembak  ·  SHIFT dash", W / 2, 320);
+  ctx.fillText("P pause  ·  M mute  ·  skor tertinggi tersimpan di browser", W / 2, 344);
+  if (high > 0) {
+    ctx.fillStyle = "#ffd166"; ctx.font = "bold 18px sans-serif";
+    ctx.fillText("HIGH SCORE: " + high, W / 2, 384);
+  }
+  // start button
+  ctx.fillStyle = "#ff4d8d";
+  ctx.beginPath(); ctx.roundRect(W / 2 - 130, 420, 260, 56, 10); ctx.fill();
+  ctx.fillStyle = "#ffffff"; ctx.font = "bold 24px sans-serif";
+  ctx.fillText("▶  MULAI", W / 2, 449);
+  ctx.fillStyle = "#5a6a9e"; ctx.font = "13px sans-serif";
+  ctx.fillText("atau tekan ENTER", W / 2, 500);
+}
+function drawGameOver() {
+  ctx.fillStyle = "rgba(5,6,15,0.72)"; ctx.fillRect(-20, -20, W + 40, H + 40);
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillStyle = "#ff4d6d"; ctx.font = "bold 52px sans-serif";
+  ctx.fillText("GAME OVER", W / 2, H / 2 - 70);
+  ctx.fillStyle = "#ffffff"; ctx.font = "bold 26px sans-serif";
+  ctx.fillText("Skor: " + score, W / 2, H / 2 - 10);
+  ctx.fillStyle = "#ffd166"; ctx.font = "18px sans-serif";
+  ctx.fillText("Terbaik: " + high + "   ·   Wave: " + wave + "   ·   Kills: " + kills + "   ·   Combo terbaik: " + bestCombo, W / 2, H / 2 + 26);
+  ctx.fillStyle = "#ff4d8d";
+  ctx.beginPath(); ctx.roundRect(W / 2 - 130, H / 2 + 56, 260, 56, 10); ctx.fill();
+  ctx.fillStyle = "#ffffff"; ctx.font = "bold 24px sans-serif";
+  ctx.fillText("↻  MAIN LAGI", W / 2, H / 2 + 85);
+  ctx.fillStyle = "#5a6a9e"; ctx.font = "13px sans-serif";
+  ctx.fillText("atau tekan ENTER", W / 2, H / 2 + 138);
+}
+function inButton(x, y, cy) { return x > W / 2 - 130 && x < W / 2 + 130 && y > cy && y < cy + 56; }
+
+/* ---------- input ---------- */
+window.addEventListener("keydown", function (ev) {
+  var k = (ev.key || "").toLowerCase();
+  keys[k] = true;
+  if (["arrowup", "arrowdown", "arrowleft", "arrowright", " "].indexOf(k) >= 0) ev.preventDefault();
+  if (k === "enter") {
+    if (state === "menu" || state === "over") startGame();
+  } else if (k === "p") {
+    if (state === "playing") { state = "paused"; }
+    else if (state === "paused") { state = "playing"; }
+  } else if (k === "m") { muted = !muted; }
+});
+window.addEventListener("keyup", function (ev) { keys[(ev.key || "").toLowerCase()] = false; });
+canvas.addEventListener("mousemove", function (ev) {
+  var r = canvas.getBoundingClientRect();
+  mouse.x = (ev.clientX - r.left) * (W / r.width);
+  mouse.y = (ev.clientY - r.top) * (H / r.height);
+  mouse.seen = true;
+});
+canvas.addEventListener("mousedown", function (ev) {
+  ac();
+  var r = canvas.getBoundingClientRect();
+  var x = (ev.clientX - r.left) * (W / r.width), y = (ev.clientY - r.top) * (H / r.height);
+  if (state === "menu") { if (inButton(x, y, 420)) startGame(); return; }
+  if (state === "over") { if (inButton(x, y, H / 2 + 56)) startGame(); return; }
+  mouse.down = true;
+});
+window.addEventListener("mouseup", function () { mouse.down = false; });
+canvas.addEventListener("touchstart", function (ev) {
+  ev.preventDefault(); ac();
+  var r = canvas.getBoundingClientRect(), t = ev.touches[0];
+  touch.x = (t.clientX - r.left) * (W / r.width);
+  touch.y = (t.clientY - r.top) * (H / r.height);
+  touch.active = true;
+  if (state === "menu" || state === "over") startGame();
+}, { passive: false });
+canvas.addEventListener("touchmove", function (ev) {
+  ev.preventDefault();
+  var r = canvas.getBoundingClientRect(), t = ev.touches[0];
+  touch.x = (t.clientX - r.left) * (W / r.width);
+  touch.y = (t.clientY - r.top) * (H / r.height);
+}, { passive: false });
+canvas.addEventListener("touchend", function () { touch.active = false; mouse.down = false; });
+
+/* ---------- loop ---------- */
+var last = 0;
+function frame(t) {
+  requestAnimationFrame(frame);
+  var dt = Math.min(0.05, (t - last) / 1000 || 0.016);
+  last = t;
+  if (state === "playing") update(slowmo > 0 ? dt * 0.45 : dt);
+  draw();
+}
+resetPlayer();
+requestAnimationFrame(frame);
+
+// Test/debug handle (harmless in production).
+window.__voidswarm = {
+  get state() { return state; },
+  get score() { return score; },
+  get wave() { return wave; },
+  get lives() { return lives; },
+  start: startGame,
+  step: function (dt) { if (state === "playing") update(dt); draw(); }
+};
+</script>
+</body>
+</html>
